@@ -1,0 +1,4 @@
+weekly-graded/*
+.ipynb_checkpoints/
+hopper.json
+lectures/model/*
