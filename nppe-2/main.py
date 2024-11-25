@@ -1,30 +1,21 @@
 from tqdm import tqdm
-from datasets import load_dataset
-from torch.utils.data import DataLoader
+from datasets import load_dataset, Dataset, load_from_disk
+from torch.utils.data import DataLoader, TensorDataset
 import torch
 from torch import nn
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 from sklearn.model_selection import train_test_split
-import numpy as np
 from sklearn.metrics import accuracy_score
+from line_profiler import profile
 
 torch.manual_seed(42)
+device = torch.device("cuda")
 
-
-# In[2]:
-
-
-ds = load_dataset("facebook/voxpopuli", "sl", split="train").shuffle(seed=42)
-
-
-# In[3]:
-
-
+ds = load_dataset("facebook/voxpopuli", "sl", split="train", streaming=True).shuffle(seed=42)
 processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
+feat_extract = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h").to(device)
 
 
-# Padding doesn't really matter - regardless of padding, the number of frames, the embedding dimension, and the features themselves are all identical
 def feat(sample, padding=True):
     enc = processor(
         sample["audio"]["array"],
@@ -32,19 +23,22 @@ def feat(sample, padding=True):
         return_tensors="pt",
         padding=padding,
     )
+    enc['input_values'] = enc['input_values'].to(device)
     with torch.no_grad():
-        output = model(**enc)
+        output = feat_extract(**enc)
     return {
-        "features": output.last_hidden_state,
+        "features": output.last_hidden_state[0],
         "n_frames": output.last_hidden_state.shape[1],
+        "labels": sample["speaker_id"],
     }
 
 
-features = ds.map(feat)
-ds_filtered = features.filter(lambda x: x["n_frames"] >= 200, num_proc=9)
+ds_filtered = ds.map(
+    feat, remove_columns=ds.column_names
+).filter(lambda x: x["n_frames"] >= 200)
 
 
-speakers = list(set(ds_filtered["speaker_id"]))
+speakers = list(set([sample['labels'] for sample in ds_filtered]))
 speakers = sorted(speakers)
 spk_mapping = {spk: i for i, spk in enumerate(speakers)}
 
@@ -110,29 +104,46 @@ class SpeakerClassification(nn.Module):
         return x
 
 
-ix = np.arange(len(ds_filtered))
-trix, tsix = train_test_split(ix, test_size=0.2, random_state=42)
-trix, valix = train_test_split(trix, test_size=0.1, random_state=42)
+print('Defined model...')
 
-train_dataset = ds_filtered.select(trix)
-test_dataset = ds_filtered.select(tsix)
-val_dataset = ds_filtered.select(valix)
+feats = torch.stack(
+    [sample["features"][:200] for sample in ds_filtered.select_columns(['features'])]
+).transpose(2, 1)
+labels = torch.tensor(
+    [spk_mapping[sample["labels"]] for sample in ds_filtered.select_columns(['labels'])]
+)
+
+xtr, xts, ytr, yts = train_test_split(feats, labels, test_size=0.2, random_state=42)
+xtr, xval, ytr, yval = train_test_split(xtr, ytr, test_size=0.1, random_state=42)
+train_dataset = TensorDataset(xtr, ytr)
+test_dataset = TensorDataset(xts, yts)
+val_dataset = TensorDataset(xval, yval)
+
+# flattened_ds = [
+#         {"features": sample["features"][:200], "label": sample['labels']}
+#     for sample in ds_filtered.select_columns(['features', 'labels'])]
+# train_split, test_split = train_test_split(flattened_ds, test_size=0.2, random_state=42)
+# train_split, val_split = train_test_split(train_split, test_size=0.1, random_state=42)
+#
+# train_dataset = TensorDataset()
+# test_dataset = Dataset.from_list(test_split)
+# val_dataset = Dataset.from_list(val_split)
+
+print("Datasets ready...")
 
 
-def collate(batch):
-    feats = torch.stack(
-        [torch.tensor(sample["features"][0])[:200] for sample in batch]
-    ).transpose(2, 1)
-    labels = torch.tensor([spk_mapping[sample["speaker_id"]] for sample in batch])
-    return {"batch": feats, "labels": labels}
+# @profile
+# def collate(batch, labels):
+#     features = torch.tensor([sample["features"][:200] for sample in batch])
+#     labels = torch.tensor([spk_mapping[sample["label"]] for sample in batch])
+#     return features.transpose(2, 1), labels
 
 
-train_dataloader = DataLoader(train_dataset, batch_size=100, collate_fn=collate)
-test_dataloader = DataLoader(test_dataset, batch_size=1, collate_fn=collate)
-val_dataloader = DataLoader(val_dataset, batch_size=10, collate_fn=collate)
+train_dataloader = DataLoader(train_dataset, batch_size=100)  # , collate_fn=collate)
+test_dataloader = DataLoader(test_dataset, batch_size=1)  # , collate_fn=collate)
+val_dataloader = DataLoader(val_dataset, batch_size=10)  # , collate_fn=collate)
 
 
-device = torch.device("cuda")
 model = SpeakerClassification(n_classes=len(spk_mapping))
 model.to(device)
 
@@ -140,53 +151,56 @@ losser = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 
-n_epochs = 100
+@profile
+def train(model, losser, optimizer, test_dataloader, val_dataloader, n_epochs=10):
+    for i in tqdm(range(n_epochs), desc="Epoch"):
+        model.train()
+        epoch_train_loss = 0
 
-for i in tqdm(range(n_epochs), desc="Epoch"):
-    model.train()
-    epoch_train_loss = 0
+        y_true_train = []
+        y_pred_train = []
 
-    y_true_train = []
-    y_pred_train = []
+        # for batch in tqdm(train_dataloader, total=len(train_dataloader), desc='Train batch', leave=False):
+        for batch, labels in train_dataloader:
+            optimizer.zero_grad()
+            outputs = model(batch.to(device))
+            loss = losser(outputs, labels.to(device))
+            loss.backward()
+            optimizer.step()
+            batch_loss = loss.item()
+            epoch_train_loss += batch_loss
 
-    # for batch in tqdm(train_dataloader, total=len(train_dataloader), desc='Train batch', leave=False):
-    for batch in train_dataloader:
-        optimizer.zero_grad()
-        outputs = model(batch["batch"].to(device))
-        loss = losser(outputs, batch["labels"].to(device))
-        loss.backward()
-        optimizer.step()
-        batch_loss = loss.item()
-        epoch_train_loss += batch_loss
+            y_true = labels.tolist()
+            y_true_train.extend(y_true)
+            y_pred = torch.argmax(nn.functional.softmax(outputs, dim=1), axis=1).tolist()
+            y_pred_train.extend(y_pred)
+            # print(f'\tBatch train loss: {batch_loss}; Batch train accuracy: {round(accuracy_score(y_true, y_pred), 2)}')
+        epoch_train_loss = epoch_train_loss / len(train_dataloader)
 
-        y_true = batch["labels"].tolist()
-        y_true_train.extend(y_true)
-        y_pred = torch.argmax(nn.functional.softmax(outputs, dim=1), axis=1).tolist()
-        y_pred_train.extend(y_pred)
-        # print(f'\tBatch train loss: {batch_loss}; Batch train accuracy: {round(accuracy_score(y_true, y_pred), 2)}')
-    epoch_train_loss = epoch_train_loss / len(train_dataloader)
+        # Validation
+        y_true_val = []
+        y_pred_val = []
+        model.eval()
+        epoch_val_loss = 0
+        with torch.no_grad():
+            # for batch in tqdm(val_dataloader, total=len(val_dataloader), desc='Val batch', leave=False):
+            for batch, labels in val_dataloader:
+                output = model(batch.to(device))
+                loss = losser(output, labels.to(device))
+                batch_val_loss = loss.item()
+                epoch_val_loss += batch_val_loss
+                y_true = labels.tolist()
+                y_true_val.extend(y_true)
+                y_pred = torch.argmax(output, axis=1).tolist()
+                y_pred_val.extend(y_pred)
+                # print(f'\tBatch val loss: {batch_val_loss}; Batch val accuracy: {round(accuracy_score(y_true, y_pred), 2)}')
 
-    # Validation
-    y_true_val = []
-    y_pred_val = []
-    model.eval()
-    epoch_val_loss = 0
-    with torch.no_grad():
-        # for batch in tqdm(val_dataloader, total=len(val_dataloader), desc='Val batch', leave=False):
-        for batch in val_dataloader:
-            output = model(batch["batch"].to(device))
-            loss = losser(output, batch["labels"].to(device))
-            batch_val_loss = loss.item()
-            epoch_val_loss += batch_val_loss
-            y_true = batch["labels"].tolist()
-            y_true_val.extend(y_true)
-            y_pred = torch.argmax(nn.functional.softmax(output, dim=1), axis=1).tolist()
-            y_pred_val.extend(y_pred)
-            # print(f'\tBatch val loss: {batch_val_loss}; Batch val accuracy: {round(accuracy_score(y_true, y_pred), 2)}')
+        train_acc = round(accuracy_score(y_true_train, y_pred_train), 2)
+        val_acc = round(accuracy_score(y_true_val, y_pred_val), 2)
+        epoch_val_loss = epoch_val_loss / len(val_dataloader)
+        print(
+            f"Epoch {i}: Train loss: {round(epoch_train_loss, 3)}; Train acc: {train_acc}; Val loss: {round(epoch_val_loss, 3)}; Val acc: {val_acc}"
+        )
 
-    train_acc = round(accuracy_score(y_true_train, y_pred_train), 2)
-    val_acc = round(accuracy_score(y_true_val, y_pred_val), 2)
-    epoch_val_loss = epoch_val_loss / len(val_dataloader)
-    print(
-        f"Epoch {i}: Train loss: {round(epoch_train_loss, 3)}; Train acc: {train_acc}; Val loss: {round(epoch_val_loss, 3)}; Val acc: {val_acc}"
-    )
+
+train(model, losser, optimizer, test_dataloader, val_dataloader, n_epochs=100)
