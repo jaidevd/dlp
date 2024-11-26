@@ -1,13 +1,15 @@
 from torchvision.datasets import ImageFolder
-from torchvision.models import resnet18
-from torchvision.models.resnet import ResNet18_Weights
+from torchvision.io import decode_image, ImageReadMode
+from torchvision.models import resnet50
+from torchvision.models.resnet import ResNet50_Weights
 from torchvision.transforms.v2 import functional as trx
 from torch import nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, StackDataset
 import torch
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
+from joblib import Parallel, delayed
 from tqdm import tqdm
 
 
@@ -27,9 +29,6 @@ LABELS = {
 }
 
 
-# proc = ResNet18_Weights.DEFAULT.transforms().to(device)
-
-
 def collate(batch):
     images, labels = zip(*batch)
     images = torch.stack(images).to(device)
@@ -38,23 +37,26 @@ def collate(batch):
     return images, torch.tensor(labels).to(device)
 
 
-def resize_crop(image):
-    image = trx.to_image(image)
+def read(path, label):
+    image = decode_image(path, mode=ImageReadMode.RGB)
     image = trx.resize(image, [256])
     image = trx.center_crop(image, [224])
-    return image
+    return image, label
 
 
-ds = ImageFolder("data/train/", transform=resize_crop)
-trix, valix = train_test_split(range(len(ds)), test_size=0.2, stratify=ds.targets)
+folder = ImageFolder("data/train/")
+tensor_labels = Parallel(n_jobs=-1)(delayed(read)(path, label) for path, label in folder.samples)
+tensors, labels = zip(*tensor_labels)
 
+ds = StackDataset(tensors, labels)
+trix, valix = train_test_split(range(len(ds)), test_size=0.2, stratify=labels)
 train_ds, val_ds = Subset(ds, trix), Subset(ds, valix)
 
 
-train_loader = DataLoader(train_ds, batch_size=256, shuffle=True, collate_fn=collate)
+train_loader = DataLoader(train_ds, batch_size=256, collate_fn=collate)
 val_loader = DataLoader(val_ds, batch_size=128, collate_fn=collate)
 
-model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
 
 for param in model.parameters():
     param.requires_grad = False
@@ -63,7 +65,7 @@ model.fc = nn.Linear(model.fc.in_features, len(LABELS))
 model = model.to(device)
 
 losser = nn.CrossEntropyLoss()
-optimizer = Adam(model.fc.parameters(), lr=0.001)
+optimizer = Adam(model.fc.parameters(), lr=0.0005)
 
 
 def train(n_epochs=1):
@@ -101,4 +103,4 @@ def train(n_epochs=1):
 
 
 train(100)
-model.save("models/resnet18-fc.pth")
+torch.save(model.state_dict(), "models/resnet60-100-epoch.pth")
