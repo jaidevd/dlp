@@ -1,12 +1,11 @@
 from tqdm import tqdm
-from datasets import load_dataset, Dataset, load_from_disk
-from torch.utils.data import DataLoader, TensorDataset
+from datasets import load_dataset
+from torch.utils.data import DataLoader
 import torch
 from torch import nn
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-from line_profiler import profile
 
 torch.manual_seed(42)
 device = torch.device("cuda")
@@ -36,11 +35,6 @@ def feat(sample, padding=True):
 ds_filtered = ds.map(
     feat, remove_columns=ds.column_names
 ).filter(lambda x: x["n_frames"] >= 200)
-
-
-speakers = list(set([sample['labels'] for sample in ds_filtered]))
-speakers = sorted(speakers)
-spk_mapping = {spk: i for i, spk in enumerate(speakers)}
 
 
 class SpeakerClassification(nn.Module):
@@ -106,42 +100,27 @@ class SpeakerClassification(nn.Module):
 
 print('Defined model...')
 
-feats = torch.stack(
-    [sample["features"][:200] for sample in ds_filtered.select_columns(['features'])]
-).transpose(2, 1)
-labels = torch.tensor(
-    [spk_mapping[sample["labels"]] for sample in ds_filtered.select_columns(['labels'])]
-)
+xy = [(sample['features'], sample['labels']) for sample in ds_filtered]
+xtrain, xtest = train_test_split(xy, test_size=0.2, random_state=42, stratify=[l[1] for l in xy])
+xtrain, xval = train_test_split(xtrain, test_size=0.1, random_state=42,
+                                stratify=[l[1] for l in xtrain])
 
-xtr, xts, ytr, yts = train_test_split(feats, labels, test_size=0.2, random_state=42)
-xtr, xval, ytr, yval = train_test_split(xtr, ytr, test_size=0.1, random_state=42)
-train_dataset = TensorDataset(xtr, ytr)
-test_dataset = TensorDataset(xts, yts)
-val_dataset = TensorDataset(xval, yval)
-
-# flattened_ds = [
-#         {"features": sample["features"][:200], "label": sample['labels']}
-#     for sample in ds_filtered.select_columns(['features', 'labels'])]
-# train_split, test_split = train_test_split(flattened_ds, test_size=0.2, random_state=42)
-# train_split, val_split = train_test_split(train_split, test_size=0.1, random_state=42)
-#
-# train_dataset = TensorDataset()
-# test_dataset = Dataset.from_list(test_split)
-# val_dataset = Dataset.from_list(val_split)
+speakers = list(set([sample[1] for sample in xy]))
+speakers = sorted(speakers)
+spk_mapping = {spk: i for i, spk in enumerate(speakers)}
 
 print("Datasets ready...")
 
 
-# @profile
-# def collate(batch, labels):
-#     features = torch.tensor([sample["features"][:200] for sample in batch])
-#     labels = torch.tensor([spk_mapping[sample["label"]] for sample in batch])
-#     return features.transpose(2, 1), labels
+def collate(batch):
+    feats = torch.stack([sample[0][:200] for sample in batch])
+    labels = torch.tensor([spk_mapping[sample[1]] for sample in batch])
+    return feats.transpose(2, 1), labels
 
 
-train_dataloader = DataLoader(train_dataset, batch_size=100)  # , collate_fn=collate)
-test_dataloader = DataLoader(test_dataset, batch_size=1)  # , collate_fn=collate)
-val_dataloader = DataLoader(val_dataset, batch_size=10)  # , collate_fn=collate)
+train_dataloader = DataLoader(xtrain, batch_size=100, collate_fn=collate)
+test_dataloader = DataLoader(xtest, batch_size=1, collate_fn=collate)
+val_dataloader = DataLoader(xval, batch_size=10, collate_fn=collate)
 
 
 model = SpeakerClassification(n_classes=len(spk_mapping))
@@ -151,7 +130,6 @@ losser = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 
-@profile
 def train(model, losser, optimizer, test_dataloader, val_dataloader, n_epochs=10):
     for i in tqdm(range(n_epochs), desc="Epoch"):
         model.train()
@@ -204,3 +182,15 @@ def train(model, losser, optimizer, test_dataloader, val_dataloader, n_epochs=10
 
 
 train(model, losser, optimizer, test_dataloader, val_dataloader, n_epochs=100)
+
+# Find test accuracy
+y_pred = []
+y_true = []
+with torch.no_grad():
+    model.eval()
+    for batch, labels in test_dataloader:
+        output = model(batch.to(device))
+        y_true.extend(labels.tolist())
+        y_pred.extend(torch.argmax(output, axis=1).tolist())
+test_acc = accuracy_score(y_true, y_pred)
+print('Test Accuracy:', test_acc)
