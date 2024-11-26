@@ -2,3 +2,9 @@ weekly-graded/*
 .ipynb_checkpoints/
 hopper.json
 lectures/model/*
+profile_output*
+
+*.mp3
+*.srt
+*.wav
+*.csv
