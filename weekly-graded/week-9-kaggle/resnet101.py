@@ -11,8 +11,8 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader, Subset, StackDataset
 from torchvision.datasets import ImageFolder
 from torchvision.io import decode_image, ImageReadMode
-from torchvision.models import resnet50
-from torchvision.models.resnet import ResNet50_Weights
+from torchvision.models import resnet101
+from torchvision.models.resnet import ResNet101_Weights
 from torchvision.transforms.v2 import functional as trx
 from tqdm import tqdm
 
@@ -94,7 +94,7 @@ def get_loaders(root):
 
 
 def get_model():
-    model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+    model = resnet101(weights=ResNet101_Weights.IMAGENET1K_V1)
     for param in model.parameters():
         param.requires_grad = False
     model.fc = nn.Linear(model.fc.in_features, len(LABELS))
@@ -104,7 +104,7 @@ def get_model():
 
 def train(model, train_loader, val_loader, n_epochs=1, fname="models/resnet50.pth"):
     losser = nn.CrossEntropyLoss()
-    optimizer = Adam(model.fc.parameters(), lr=0.0005)
+    optimizer = Adam(model.fc.parameters(), lr=0.001)
     for epoch in tqdm(range(n_epochs)):
         train_loss = val_loss = 0
         model.train()
@@ -160,4 +160,4 @@ def predict(model, dfpath="data/sample_submission.csv", imgroot="data/test/",
 if __name__ == "__main__":
     train_loader, val_loader = get_loaders("data/train/")
     model = get_model()
-    train(model, train_loader, val_loader, n_epochs=50, fname="models/resnet50-best.pth")
+    train(model, train_loader, val_loader, n_epochs=50, fname="models/resnet101-best.pth")
