@@ -8,6 +8,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torchmetrics.detection import MeanAveragePrecision
 from torchvision.io import decode_image, ImageReadMode
 from torchvision.transforms.v2 import functional as trx
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
@@ -15,7 +16,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from tqdm import tqdm
 
 op = os.path
-LABELS = {
+ORG_LABELS = {
     "aegypti": 0,
     "albopictus": 1,
     "anopheles": 2,
@@ -23,11 +24,12 @@ LABELS = {
     "culiseta": 4,
     "japonicus/koreicus": 5,
 }
+LABELS = {k: v + 1 for k, v in ORG_LABELS.items()}
 ID2LABEL = {v: k for k, v in LABELS.items()}
 BAR_FORMAT = '{l_bar}{bar}| {n_fmt}/{total_fmt} {rate_fmt}{postfix}'
 
 
-class MosquitoDataset(Dataset):
+class TrainDataset(Dataset):
     def __init__(self, df, root):
         self.df = df
         self.root = root
@@ -49,7 +51,7 @@ class MosquitoDataset(Dataset):
         x0, y0 = x_center - width / 2, y_center - height / 2
         x1, y1 = x_center + width / 2, y_center + height / 2
         boxes = torch.tensor([x0, y0, x1, y1]).unsqueeze(0)
-        labels = torch.tensor([row["label"]], dtype=torch.int64)
+        labels = torch.tensor([row["label"] + 1], dtype=torch.int64)
         return image, {"boxes": boxes, "labels": labels}
 
     def show(self, n):
@@ -107,7 +109,7 @@ def get_model(device=None):
     for p in model.parameters():
         p.requires_grad = False
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, len(LABELS))
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, len(LABELS) + 1)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return model.to(device)
@@ -156,10 +158,12 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
     opt = torch.optim.Adam(model.roi_heads.box_predictor.parameters(), lr=1e-3)
     b_len = len(train_loader) + len(test_loader)
     epoch_history = defaultdict(list)  # NOQA: F841
+    metric = MeanAveragePrecision(class_metrics=True)
     with tqdm(desc="Epoch", total=n_epochs, bar_format=BAR_FORMAT) as ebar:
         for epoch in range(n_epochs):
             model.train()
             epoch_train_loss = epoch_val_loss = 0
+            epoch_val_metric = 0
             with tqdm(desc="Batch", total=b_len, bar_format=BAR_FORMAT, leave=False) as bbar:
                 for images, targets in train_loader:
                     opt.zero_grad()
@@ -168,27 +172,43 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
                     batch_train_loss.backward()
                     opt.step()
                     bbar.update(1)
-                    bbar.set_postfix_str(f"Train(loss={batch_train_loss:.3f})")
+                    bbar.set_postfix_str(
+                        f"Train(loss={batch_train_loss:.3f})", refresh=True)
                     epoch_train_loss += batch_train_loss.item()
                 for images, targets in test_loader:
-                    # model.eval()  - only used when predicting
+                    model.eval()
                     with torch.no_grad():
-                        loss_dict = model(images, targets)
-                        batch_test_loss = sum(loss for loss in loss_dict.values())
-                    epoch_val_loss += batch_test_loss.item()
+                        preds = model(images, targets)
+                    epoch_val_metric += metric(preds, targets)['map_per_class'].mean().item()
                     bbar.update(1)
                 epoch_train_loss /= len(train_loader)
                 epoch_val_loss /= len(test_loader)
+                epoch_val_metric /= len(test_loader)
             report = history(epoch_history, train_loss=epoch_train_loss,
-                             val_loss=epoch_val_loss, patience=patience)
+                             val_loss=epoch_val_loss, val_metric=epoch_val_metric,
+                             patience=patience)
             update_postfix(ebar, report)
+
+
+def predict(model, root, batch_size=8, device=None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    files = [op.join(root, f) for f in os.listdir(root)]
+    preds = []
+    for file in tqdm(files):
+        image = decode_image(file, ImageReadMode.RGB)
+        image = trx.to_dtype(image, torch.float32, scale=True)
+        with torch.no_grad():
+            preds.append(model([image.to(device)])[0])
+    return preds
 
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = "data/train"
     dftrain, dftest = make_df(root, stratify=True)
-    dstrain, dstest = MosquitoDataset(dftrain, root), MosquitoDataset(dftest, root)
+    dstrain, dstest = TrainDataset(dftrain, root), TrainDataset(dftest, root)
     model = get_model(device)
     train_loader = DataLoader(
         dstrain, batch_size=4, shuffle=True, collate_fn=partial(collate, device=device)
@@ -196,5 +216,5 @@ if __name__ == "__main__":
     test_loader = DataLoader(
         dstest, batch_size=2, shuffle=False, collate_fn=partial(collate, device=device)
     )
-    train(model, train_loader, test_loader, n_epochs=5)
+    train(model, train_loader, test_loader, n_epochs=10)
     torch.save(model.state_dict(), "faster-rcnn.pth")
