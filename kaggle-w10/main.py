@@ -1,0 +1,200 @@
+from collections import defaultdict
+from functools import partial
+import os
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision.io import decode_image, ImageReadMode
+from torchvision.transforms.v2 import functional as trx
+from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from tqdm import tqdm
+
+op = os.path
+LABELS = {
+    "aegypti": 0,
+    "albopictus": 1,
+    "anopheles": 2,
+    "culex": 3,
+    "culiseta": 4,
+    "japonicus/koreicus": 5,
+}
+ID2LABEL = {v: k for k, v in LABELS.items()}
+BAR_FORMAT = '{l_bar}{bar}| {n_fmt}/{total_fmt} {rate_fmt}{postfix}'
+
+
+class MosquitoDataset(Dataset):
+    def __init__(self, df, root):
+        self.df = df
+        self.root = root
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        path = op.join(self.root, "images", f"{row['id']}.jpeg")
+        image = decode_image(path, ImageReadMode.RGB)
+        image = trx.to_dtype(image, torch.float32, scale=True)
+        _, im_height, im_width = image.shape
+        x_center, y_center, width, height = row[
+            ["x_center", "y_center", "width", "height"]
+        ]
+        x_center, width = x_center * im_width, width * im_width
+        y_center, height = y_center * im_height, height * im_height
+        x0, y0 = x_center - width / 2, y_center - height / 2
+        x1, y1 = x_center + width / 2, y_center + height / 2
+        boxes = torch.tensor([x0, y0, x1, y1]).unsqueeze(0)
+        labels = torch.tensor([row["label"]], dtype=torch.int64)
+        return image, {"boxes": boxes, "labels": labels}
+
+    def show(self, n):
+        fig, ax = plt.subplots(nrows=n, ncols=n)
+        samples = [self[i] for i in np.random.choice(len(self), size=n * n)]
+        for (im, box), ax in zip(samples, ax.ravel()):
+            ax.imshow(im.permute(1, 2, 0))
+            x0, y0, x1, y1 = box["boxes"][0]
+            ax.add_patch(
+                plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="green")
+            )
+            ax.set_axis_off()
+            ax.set_title(ID2LABEL[box["labels"][0].item()])
+        plt.tight_layout()
+        plt.show()
+
+
+def make_df(root, stratify=False, test_size=0.2):
+    images_path = op.join(root, "images")
+    labels_path = op.join(root, "labels")
+    image_files = [
+        op.join(images_path, f) for f in os.listdir(images_path) if f.endswith(".jpeg")
+    ]
+    payload = []
+    for file in image_files:
+        image_id = op.splitext(op.basename(file))[0]
+        label_file = op.join(labels_path, f"{image_id}.txt")
+        with open(label_file, "r") as f_in:
+            label, x_center, y_center, width, height = map(
+                float, f_in.read().strip().split()
+            )
+            label = int(label)
+
+        payload.append(
+            dict(
+                id=image_id,
+                label=label,
+                x_center=x_center,
+                y_center=y_center,
+                width=width,
+                height=height,
+            )
+        )
+    df = pd.DataFrame.from_records(payload)
+    if not stratify:
+        return df
+    area = df["width"] * df["height"]
+    area_cat = pd.cut(area, bins=np.linspace(0, 1, 6), labels=list("ABCDE"))
+    strf_cat = df["label"].astype(int).astype(str) + area_cat.astype(str)
+    return train_test_split(df, stratify=strf_cat, test_size=test_size)
+
+
+def get_model(device=None):
+    model = fasterrcnn_resnet50_fpn_v2(weights="COCO_V1")
+    for p in model.parameters():
+        p.requires_grad = False
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, len(LABELS))
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return model.to(device)
+
+
+def collate(batch, device):
+    images, targets = zip(*batch)
+    images = [im.to(device) for im in images]
+    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+    return images, targets
+
+
+def history(cache, patience=1, **kwargs):
+    report = []
+    for metric in ["train_loss", "val_loss", "train_metric", "val_metric"]:
+        if metric not in kwargs:
+            continue
+        cache[metric].append(kwargs[metric])
+        window = cache[metric][-patience:]
+        if len(cache[metric]) >= patience + 1:
+            direction = "↓" if np.mean(window) <= cache[metric][-patience - 1] else "↑"
+        else:
+            direction = "⌾"
+
+        # Last boolean denotes whether it is minimizing
+        report.append((metric, direction, window[-1], metric.endswith("_loss")))
+    return report
+
+
+def update_postfix(bar, report):
+    bar.update(1)
+    postfix_params = {}
+    for metric, direction, value, minimizing in report:
+        value = round(value, 3)
+        if direction == "⌾":
+            colored = f"\033[33m{value}{direction}\033[0m"
+        if (minimizing and direction == "↓") or (not minimizing and direction == "↑"):
+            colored = f"\033[32m{value}{direction}\033[0m"
+        elif (minimizing and direction == "↑") or (not minimizing and direction == "↓"):
+            colored = f"\033[31m{value}{direction}\033[0m"
+        postfix_params[metric] = colored
+    bar.set_postfix(postfix_params, refresh=True)
+
+
+def train(model, train_loader, test_loader, n_epochs=1, patience=2):
+    opt = torch.optim.Adam(model.roi_heads.box_predictor.parameters(), lr=1e-3)
+    b_len = len(train_loader) + len(test_loader)
+    epoch_history = defaultdict(list)  # NOQA: F841
+    with tqdm(desc="Epoch", total=n_epochs, bar_format=BAR_FORMAT) as ebar:
+        for epoch in range(n_epochs):
+            model.train()
+            epoch_train_loss = epoch_val_loss = 0
+            with tqdm(desc="Batch", total=b_len, bar_format=BAR_FORMAT, leave=False) as bbar:
+                for images, targets in train_loader:
+                    opt.zero_grad()
+                    loss_dict = model(images, targets)
+                    batch_train_loss = sum(loss for loss in loss_dict.values())
+                    batch_train_loss.backward()
+                    opt.step()
+                    bbar.update(1)
+                    bbar.set_postfix_str(f"Train(loss={batch_train_loss:.3f})")
+                    epoch_train_loss += batch_train_loss.item()
+                for images, targets in test_loader:
+                    # model.eval()  - only used when predicting
+                    with torch.no_grad():
+                        loss_dict = model(images, targets)
+                        batch_test_loss = sum(loss for loss in loss_dict.values())
+                    epoch_val_loss += batch_test_loss.item()
+                    bbar.update(1)
+                epoch_train_loss /= len(train_loader)
+                epoch_val_loss /= len(test_loader)
+            report = history(epoch_history, train_loss=epoch_train_loss,
+                             val_loss=epoch_val_loss, patience=patience)
+            update_postfix(ebar, report)
+
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    root = "data/train"
+    dftrain, dftest = make_df(root, stratify=True)
+    dstrain, dstest = MosquitoDataset(dftrain, root), MosquitoDataset(dftest, root)
+    model = get_model(device)
+    train_loader = DataLoader(
+        dstrain, batch_size=4, shuffle=True, collate_fn=partial(collate, device=device)
+    )
+    test_loader = DataLoader(
+        dstest, batch_size=2, shuffle=False, collate_fn=partial(collate, device=device)
+    )
+    train(model, train_loader, test_loader, n_epochs=5)
+    torch.save(model.state_dict(), "faster-rcnn.pth")
