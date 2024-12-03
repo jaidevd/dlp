@@ -15,7 +15,6 @@ from torchvision.models import ResNet50_Weights
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from tqdm import tqdm
-from line_profiler import profile
 from datetime import datetime
 
 op = os.path
@@ -30,6 +29,7 @@ ORG_LABELS = {
 LABELS = {k: v + 1 for k, v in ORG_LABELS.items()}
 ID2LABEL = {v: k for k, v in LABELS.items()}
 BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} {rate_fmt}{postfix}"
+MIN_SIZE, MAX_SIZE = 800, 1333
 
 
 class TrainDataset(Dataset):
@@ -150,10 +150,30 @@ def load_model(path):
     return model
 
 
-def collate(batch, device):
+def resize_with_ar(image, box):
+    """Resize an image to exactly MIN_SIZE by MAX_SIZE. Transpose if needed."""
+    h, w = image.shape[-2:]
+    if h < w:  # landscape
+        new_image = trx.resize(image, (MIN_SIZE, MAX_SIZE))
+        box[::2] *= MAX_SIZE / w
+        box[1::2] *= MIN_SIZE / h
+    else:
+        new_image = trx.resize(image, (MAX_SIZE, MIN_SIZE)).permute(0, 2, 1)
+        box[::2] *= MIN_SIZE / w
+        box[1::2] *= MAX_SIZE / h
+    return new_image, box
+
+
+def collate(batch, device, resize=True):
     images, targets = zip(*batch)
-    images = [im.to(device) for im in images]
-    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+    if resize:
+        images, bboxes = zip(*[resize_with_ar(im, t["boxes"][0]) for im, t in zip(images, targets)])
+        new_targets = []
+        for b, l in zip(bboxes, targets):
+            l["boxes"] = b.unsqueeze(0)
+            l['labels'] = l['labels']
+            new_targets.append(l)
+        images = torch.stack(images)
     return images, targets
 
 
@@ -189,12 +209,11 @@ def update_postfix(bar, report):
     bar.set_postfix(postfix_params, refresh=True)
 
 
-@profile
 def train(model, train_loader, test_loader, n_epochs=1, patience=2):
     opt = torch.optim.Adam(model.roi_heads.box_predictor.parameters(), lr=1e-3)
     b_len = len(train_loader) + len(test_loader)
     epoch_history = defaultdict(list)  # NOQA: F841
-    metric = MeanAveragePrecision(class_metrics=True)
+    metric = MeanAveragePrecision(class_metrics=True)  # NOQA: F841
     with tqdm(desc="Epoch", total=n_epochs, bar_format=BAR_FORMAT) as ebar:
         for epoch in range(n_epochs):
             model.train()
@@ -204,8 +223,9 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
                 desc="Batch", total=b_len, bar_format=BAR_FORMAT, leave=False
             ) as bbar:
                 for images, targets in train_loader:
+                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                     opt.zero_grad()
-                    loss_dict = model(images, targets)
+                    loss_dict = model(images.to(device), targets)
                     batch_train_loss = sum(loss for loss in loss_dict.values())
                     batch_train_loss.backward()
                     opt.step()
@@ -214,15 +234,23 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
                         f"Train(loss={batch_train_loss:.3f})", refresh=True
                     )
                     epoch_train_loss += batch_train_loss.item()
+                epoch_train_loss /= len(train_loader)
                 for images, targets in test_loader:
-                    model.eval()
+                    images = [im.to(device) for im in images]
+                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                    # model.eval()
                     with torch.no_grad():
                         preds = model(images, targets)
-                    epoch_val_metric += (
-                        metric(preds, targets)["map_per_class"].mean().item()
+                    batch_val_loss = sum(loss for loss in preds.values())
+                    # epoch_val_metric += (
+                    #     metric(preds, targets)["map_per_class"].mean().item()
+                    # )
+                    bbar.set_postfix_str(
+                        f"Train(loss={epoch_train_loss:.3f});Val(loss={batch_val_loss:.3f})",
+                        refresh=True
                     )
+                    epoch_val_loss += batch_val_loss.item()
                     bbar.update(1)
-                epoch_train_loss /= len(train_loader)
                 epoch_val_loss /= len(test_loader)
                 epoch_val_metric /= len(test_loader)
             report = history(
@@ -298,17 +326,20 @@ def make_submission(
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # root = "data/train"
-    # dftrain, dftest = make_df(root, stratify=True)
-    # dstrain, dstest = TrainDataset(dftrain, root), TrainDataset(dftest, root)
-    # model = get_model(device)
-    # train_loader = DataLoader(
-    #     dstrain, batch_size=4, shuffle=True, collate_fn=partial(collate, device=device)
-    # )
-    # test_loader = DataLoader(
-    #     dstest, batch_size=2, shuffle=False, collate_fn=partial(collate, device=device)
-    # )
-    # train(model, train_loader, test_loader, n_epochs=1)
-    # torch.save(model.state_dict(), "faster-rcnn.pth")
-    model = load_model("faster-rcnn.pth")
-    make_submission(model, "data/test/images/", show=4, seed=42)
+    root = "data/train"
+    dftrain, dftest = make_df(root, stratify=True)
+    dstrain, dstest = TrainDataset(dftrain, root), TrainDataset(dftest, root)
+    model = get_model(device)
+    train_loader = DataLoader(
+        dstrain, batch_size=14, shuffle=True, num_workers=6,
+        collate_fn=partial(collate, device=device),
+    )
+    test_loader = DataLoader(
+        dstest, batch_size=4, shuffle=False, num_workers=2,
+        collate_fn=partial(collate, device=device, resize=False)
+
+    )
+    train(model, train_loader, test_loader, n_epochs=10)
+    torch.save(model.state_dict(), "faster-rcnn.pth")
+    model = load_model("faster-rcnn-10-epochs.pth")
+    make_submission(model, "data/test/images/", show=4)
