@@ -1,5 +1,5 @@
 from collections import defaultdict
-from functools import partial
+from functools import partial  # NOQA: F401
 import os
 
 import matplotlib.pyplot as plt
@@ -7,13 +7,16 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader  # NOQA: F401
 from torchmetrics.detection import MeanAveragePrecision
 from torchvision.io import decode_image, ImageReadMode
 from torchvision.transforms.v2 import functional as trx
+from torchvision.models import ResNet50_Weights
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from tqdm import tqdm
+from line_profiler import profile
+from datetime import datetime
 
 op = os.path
 ORG_LABELS = {
@@ -26,13 +29,16 @@ ORG_LABELS = {
 }
 LABELS = {k: v + 1 for k, v in ORG_LABELS.items()}
 ID2LABEL = {v: k for k, v in LABELS.items()}
-BAR_FORMAT = '{l_bar}{bar}| {n_fmt}/{total_fmt} {rate_fmt}{postfix}'
+BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} {rate_fmt}{postfix}"
 
 
 class TrainDataset(Dataset):
-    def __init__(self, df, root):
+    def __init__(self, df, root, device=None):
         self.df = df
         self.root = root
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
 
     def __len__(self):
         return len(self.df)
@@ -54,19 +60,39 @@ class TrainDataset(Dataset):
         labels = torch.tensor([row["label"] + 1], dtype=torch.int64)
         return image, {"boxes": boxes, "labels": labels}
 
-    def show(self, n):
-        fig, ax = plt.subplots(nrows=n, ncols=n)
+    def show(self, n, model=None, seed=None):
+        fig, ax = plt.subplots(nrows=n, ncols=n, figsize=(3 * n, 3 * n))
+        if seed is not None:
+            np.random.seed(seed)
         samples = [self[i] for i in np.random.choice(len(self), size=n * n)]
+        preds = []
         for (im, box), ax in zip(samples, ax.ravel()):
             ax.imshow(im.permute(1, 2, 0))
             x0, y0, x1, y1 = box["boxes"][0]
             ax.add_patch(
                 plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="green")
             )
+            fig_label = ID2LABEL[box["labels"][0].item()]
+            if model is not None:
+                model.eval()
+                with torch.no_grad():
+                    pred = model([im.to(self.device)])
+                preds.append(pred[0])
+                ix = pred[0]["scores"].argmax().item()
+                predbox = pred[0]["boxes"][ix]
+                predlabel = ID2LABEL[pred[0]["labels"][ix].item()]
+                x0, y0, x1, y1 = predbox.cpu().numpy()
+                ax.add_patch(
+                    plt.Rectangle(
+                        (x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="red"
+                    )
+                )
+                fig_label = f"{fig_label} ({predlabel})"
             ax.set_axis_off()
-            ax.set_title(ID2LABEL[box["labels"][0].item()])
+            ax.set_title(fig_label, fontsize="small")
         plt.tight_layout()
-        plt.show()
+        plt.savefig("foo.png", bbox_inches="tight")
+        return preds, samples
 
 
 def make_df(root, stratify=False, test_size=0.2):
@@ -105,7 +131,10 @@ def make_df(root, stratify=False, test_size=0.2):
 
 
 def get_model(device=None):
-    model = fasterrcnn_resnet50_fpn_v2(weights="COCO_V1")
+    model = fasterrcnn_resnet50_fpn_v2(
+        weights="COCO_V1",
+        weights_backbone=ResNet50_Weights.IMAGENET1K_V2,
+    )
     for p in model.parameters():
         p.requires_grad = False
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -113,6 +142,12 @@ def get_model(device=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return model.to(device)
+
+
+def load_model(path):
+    model = get_model()
+    model.load_state_dict(torch.load(path, weights_only=True))
+    return model
 
 
 def collate(batch, device):
@@ -154,6 +189,7 @@ def update_postfix(bar, report):
     bar.set_postfix(postfix_params, refresh=True)
 
 
+@profile
 def train(model, train_loader, test_loader, n_epochs=1, patience=2):
     opt = torch.optim.Adam(model.roi_heads.box_predictor.parameters(), lr=1e-3)
     b_len = len(train_loader) + len(test_loader)
@@ -164,7 +200,9 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
             model.train()
             epoch_train_loss = epoch_val_loss = 0
             epoch_val_metric = 0
-            with tqdm(desc="Batch", total=b_len, bar_format=BAR_FORMAT, leave=False) as bbar:
+            with tqdm(
+                desc="Batch", total=b_len, bar_format=BAR_FORMAT, leave=False
+            ) as bbar:
                 for images, targets in train_loader:
                     opt.zero_grad()
                     loss_dict = model(images, targets)
@@ -173,48 +211,104 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
                     opt.step()
                     bbar.update(1)
                     bbar.set_postfix_str(
-                        f"Train(loss={batch_train_loss:.3f})", refresh=True)
+                        f"Train(loss={batch_train_loss:.3f})", refresh=True
+                    )
                     epoch_train_loss += batch_train_loss.item()
                 for images, targets in test_loader:
                     model.eval()
                     with torch.no_grad():
                         preds = model(images, targets)
-                    epoch_val_metric += metric(preds, targets)['map_per_class'].mean().item()
+                    epoch_val_metric += (
+                        metric(preds, targets)["map_per_class"].mean().item()
+                    )
                     bbar.update(1)
                 epoch_train_loss /= len(train_loader)
                 epoch_val_loss /= len(test_loader)
                 epoch_val_metric /= len(test_loader)
-            report = history(epoch_history, train_loss=epoch_train_loss,
-                             val_loss=epoch_val_loss, val_metric=epoch_val_metric,
-                             patience=patience)
+            report = history(
+                epoch_history,
+                train_loss=epoch_train_loss,
+                val_loss=epoch_val_loss,
+                val_metric=epoch_val_metric,
+                patience=patience,
+            )
             update_postfix(ebar, report)
 
 
-def predict(model, root, batch_size=8, device=None):
+def make_submission(
+    model,
+    root,
+    outpath=None,
+    show=0,
+    seed=None,
+    dfpath="data/sample_submission.csv",
+    device=None,
+):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
-    files = [op.join(root, f) for f in os.listdir(root)]
-    preds = []
-    for file in tqdm(files):
-        image = decode_image(file, ImageReadMode.RGB)
+    df = pd.read_csv(dfpath, index_col="ImageID")
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        path = op.join(root, idx)
+        image = decode_image(path, ImageReadMode.RGB)
         image = trx.to_dtype(image, torch.float32, scale=True)
         with torch.no_grad():
-            preds.append(model([image.to(device)])[0])
-    return preds
+            pred = model([image.to(device)])[0]
+        try:
+            ix = pred["scores"].argmax().item()
+            conf = pred["scores"][ix].item()
+            predbox = pred["boxes"][ix]
+            label = ID2LABEL[pred["labels"][ix].item() - 1]
+            x0, y0, x1, y1 = predbox.cpu().numpy()
+            _, im_height, im_width = image.shape
+            xcenter, ycenter = (x0 + x1) / 2, (y0 + y1) / 2
+            box_width, box_height = x1 - x0, y1 - y0
+            xcenter, box_width = xcenter / im_width, box_width / im_width
+            ycenter, box_height = ycenter / im_height, box_height / im_height
+        except IndexError:
+            label, conf, xcenter, ycenter, box_width, box_height = "albopictus", 0, 0, 0, 0, 0
+        df.loc[idx, ['LabelName', 'Conf', 'xcenter', 'ycenter', 'bbx_width', 'bbx_height']] = [
+            label, conf, xcenter, ycenter, box_width, box_height
+        ]
+    if outpath is None:
+        outpath = f"submission-{datetime.now().isoformat()}.csv"
+    df.to_csv(outpath)
+    if show:
+        np.random.seed(seed)
+        xdf = df.loc[np.random.choice(df.index, size=(show * show))]
+        fig, ax = plt.subplots(nrows=show, ncols=show, figsize=(3 * show, 3 * show))
+        for (idx, row), ax in zip(xdf.iterrows(), ax.ravel()):
+            path = op.join(root, idx)
+            image = decode_image(path, ImageReadMode.RGB)
+            _, im_height, im_width = image.shape
+            ax.imshow(image.permute(1, 2, 0))
+            xcenter, ycenter, box_width, box_height = row[["xcenter", "ycenter", "bbx_width", "bbx_height"]]
+            x0, y0 = xcenter - box_width / 2, ycenter - box_height / 2
+            x1, y1 = xcenter + box_width / 2, ycenter + box_height / 2
+            x0, x1 = x0 * im_width, x1 * im_width
+            y0, y1 = y0 * im_height, y1 * im_height
+            ax.add_patch(
+                plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="red")
+            )
+            ax.set_axis_off()
+            ax.set_title(f"{row['LabelName']} ({round(row['Conf'], 2)})", fontsize="small")
+        plt.tight_layout()
+        plt.savefig("predictions.png", bbox_inches="tight")
 
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    root = "data/train"
-    dftrain, dftest = make_df(root, stratify=True)
-    dstrain, dstest = TrainDataset(dftrain, root), TrainDataset(dftest, root)
-    model = get_model(device)
-    train_loader = DataLoader(
-        dstrain, batch_size=4, shuffle=True, collate_fn=partial(collate, device=device)
-    )
-    test_loader = DataLoader(
-        dstest, batch_size=2, shuffle=False, collate_fn=partial(collate, device=device)
-    )
-    train(model, train_loader, test_loader, n_epochs=10)
-    torch.save(model.state_dict(), "faster-rcnn.pth")
+    # root = "data/train"
+    # dftrain, dftest = make_df(root, stratify=True)
+    # dstrain, dstest = TrainDataset(dftrain, root), TrainDataset(dftest, root)
+    # model = get_model(device)
+    # train_loader = DataLoader(
+    #     dstrain, batch_size=4, shuffle=True, collate_fn=partial(collate, device=device)
+    # )
+    # test_loader = DataLoader(
+    #     dstest, batch_size=2, shuffle=False, collate_fn=partial(collate, device=device)
+    # )
+    # train(model, train_loader, test_loader, n_epochs=1)
+    # torch.save(model.state_dict(), "faster-rcnn.pth")
+    model = load_model("faster-rcnn.pth")
+    make_submission(model, "data/test/images/", show=4, seed=42)
