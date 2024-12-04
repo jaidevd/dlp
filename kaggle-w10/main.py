@@ -210,7 +210,7 @@ def update_postfix(bar, report):
 
 
 def train(model, train_loader, test_loader, n_epochs=1, patience=2):
-    opt = torch.optim.Adam(model.roi_heads.box_predictor.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(model.roi_heads.box_predictor.parameters(), lr=0.0005)
     b_len = len(train_loader) + len(test_loader)
     epoch_history = defaultdict(list)  # NOQA: F841
     metric = MeanAveragePrecision(class_metrics=True)  # NOQA: F841
@@ -286,7 +286,7 @@ def make_submission(
             ix = pred["scores"].argmax().item()
             conf = pred["scores"][ix].item()
             predbox = pred["boxes"][ix]
-            label = ID2LABEL[pred["labels"][ix].item() - 1]
+            label = ID2LABEL[pred["labels"][ix].item()]
             x0, y0, x1, y1 = predbox.cpu().numpy()
             _, im_height, im_width = image.shape
             xcenter, ycenter = (x0 + x1) / 2, (y0 + y1) / 2
@@ -339,7 +339,7 @@ if __name__ == "__main__":
         collate_fn=partial(collate, device=device, resize=False)
 
     )
-    train(model, train_loader, test_loader, n_epochs=10)
-    torch.save(model.state_dict(), "faster-rcnn.pth")
-    model = load_model("faster-rcnn-10-epochs.pth")
+    train(model, train_loader, test_loader, n_epochs=30)
+    # torch.save(model.state_dict(), "faster-rcnn-30-epochs.pth")
+    model = load_model("faster-rcnn-30-epochs.pth")
     make_submission(model, "data/test/images/", show=4)
