@@ -131,7 +131,7 @@ def make_df(root, stratify=False, test_size=0.2):
 
 
 def get_model(device=None):
-    model = fcos_resnet50_fpn(weights="COCO_V1")
+    model = fcos_resnet50_fpn(weights="COCO_V1")  # , trainable_backbone_layers=0)
     for p in model.parameters():
         p.requires_grad = False
     model.head.classification_head = FCOSClassificationHead(
@@ -149,6 +149,7 @@ def load_model(path):
     return model
 
 
+# @profile
 def resize_with_ar(image, box):
     """Resize an image to exactly MIN_SIZE by MAX_SIZE. Transpose if needed."""
     h, w = image.shape[-2:]
@@ -163,7 +164,8 @@ def resize_with_ar(image, box):
     return new_image, box
 
 
-def collate(batch, device, resize=True):
+# @profile
+def collate(batch, device=False, resize=True):
     images, targets = zip(*batch)
     if resize:
         images, bboxes = zip(*[resize_with_ar(im, t["boxes"][0]) for im, t in zip(images, targets)])
@@ -173,6 +175,11 @@ def collate(batch, device, resize=True):
             l['labels'] = l['labels']
             new_targets.append(l)
         images = torch.stack(images)
+        if device:
+            images = images.to(device)
+    elif device:
+        images = [i.to(device) for i in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
     return images, targets
 
 
@@ -193,7 +200,7 @@ def update_history(cache, patience=1, **kwargs):
     return report
 
 
-def update_postfix(bar, report):
+def update_postfix(bar, report, lr):
     bar.update(1)
     postfix_params = {}
     for metric, direction, value, minimizing in report:
@@ -205,12 +212,14 @@ def update_postfix(bar, report):
         elif (minimizing and direction == "↑") or (not minimizing and direction == "↓"):
             colored = f"\033[31m{value}{direction}\033[0m"
         postfix_params[metric] = colored
+    postfix_params["lr"] = f"{round(lr[-1], 6)}"
     bar.set_postfix(postfix_params, refresh=True)
 
 
-@profile
-def train(model, train_loader, test_loader, n_epochs=1, patience=2):
+# @profile
+def train(model, train_loader, test_loader, n_epochs=1, patience=3):
     opt = torch.optim.Adam(model.head.classification_head.parameters(), lr=0.001)
+    lr = torch.optim.lr_scheduler.StepLR(opt, step_size=10, gamma=0.1)
     b_len = len(train_loader) + len(test_loader)
     epoch_history = defaultdict(list)  # NOQA: F841
     metric = MeanAveragePrecision(class_metrics=True)  # NOQA: F841
@@ -223,9 +232,8 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
                 desc="Batch", total=b_len, bar_format=BAR_FORMAT, leave=False
             ) as bbar:
                 for images, targets in train_loader:
-                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                     opt.zero_grad()
-                    loss_dict = model(images.to(device), targets)
+                    loss_dict = model(images, targets)
                     batch_train_loss = sum(loss for loss in loss_dict.values())
                     batch_train_loss.backward()
                     btl = batch_train_loss.item()
@@ -237,8 +245,6 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
                     epoch_train_loss += btl
                 epoch_train_loss /= len(train_loader)
                 for images, targets in test_loader:
-                    images = [im.to(device) for im in images]
-                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                     # model.eval()
                     with torch.no_grad():
                         preds = model(images, targets)
@@ -254,6 +260,7 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
                     bbar.update(1)
                 epoch_val_loss /= len(test_loader)
                 epoch_val_metric /= len(test_loader)
+            lr.step()
             report = update_history(
                 epoch_history,
                 train_loss=epoch_train_loss,
@@ -261,7 +268,7 @@ def train(model, train_loader, test_loader, n_epochs=1, patience=2):
                 val_metric=epoch_val_metric,
                 patience=patience,
             )
-            update_postfix(ebar, report)
+            update_postfix(ebar, report, lr.get_last_lr())
     return epoch_history
 
 
@@ -327,24 +334,24 @@ def make_submission(
 
 
 if __name__ == "__main__":
-    import json
+    # import json
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = "data/train"
     dftrain, dftest = make_df(root, stratify=True)
     dstrain, dstest = TrainDataset(dftrain, root), TrainDataset(dftest, root)
     model = get_model(device)
     train_loader = DataLoader(
-        dstrain, batch_size=24, shuffle=True, num_workers=6,
-        collate_fn=partial(collate, device=device),
+        dstrain, batch_size=16, shuffle=True,  # num_workers=6,
+        collate_fn=partial(collate, device=device, resize=True),
     )
     test_loader = DataLoader(
-        dstest, batch_size=8, shuffle=False, num_workers=2,
-        collate_fn=partial(collate, device=device, resize=False)
+        dstest, batch_size=8, shuffle=False,  # num_workers=2,
+        collate_fn=partial(collate, device=device, resize=True)
 
     )
-    history = train(model, train_loader, test_loader, n_epochs=20)
-    with open("history.json", "w") as f_out:
-        json.dump(history, f_out, indent=2)
-    torch.save(model.state_dict(), "fcos-20-epochs.pth")
+    history = train(model, train_loader, test_loader, n_epochs=1)
+    # with open("history.json", "w") as f_out:
+    #     json.dump(history, f_out, indent=2)
+    # torch.save(model.state_dict(), "fcos-40-epochs-lr.pth")
     # model = load_model("fcos-10-epochs.pth")
-    make_submission(model, "data/test/images/", show=4)
+    # make_submission(model, "data/test/images/", show=4)
