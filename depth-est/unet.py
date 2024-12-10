@@ -1,78 +1,98 @@
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 
 
-def double_conv(in_ch, out_ch):
-    """Two convolutional layers with ReLU activation."""
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True)
-    )
-
-
 class UNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1):
+
+    def __init__(self, in_channels=3, out_channels=1, init_features=32):
         super(UNet, self).__init__()
 
-        # Encoder
-        self.enc1 = double_conv(in_channels, 64)
-        self.enc2 = double_conv(64, 128)
-        self.enc3 = double_conv(128, 256)
-        self.enc4 = double_conv(256, 512)
+        features = init_features
+        self.encoder1 = UNet._block(in_channels, features, name="enc1")
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder2 = UNet._block(features, features * 2, name="enc2")
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder3 = UNet._block(features * 2, features * 4, name="enc3")
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder4 = UNet._block(features * 4, features * 8, name="enc4")
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # Bottleneck
-        self.bottleneck = double_conv(512, 1024)
+        self.bottleneck = UNet._block(features * 8, features * 16, name="bottleneck")
 
-        # Decoder
-        self.up3 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
-        self.dec3 = double_conv(1024, 512)
+        self.upconv4 = nn.ConvTranspose2d(
+            features * 16, features * 8, kernel_size=2, stride=2
+        )
+        self.decoder4 = UNet._block((features * 8) * 2, features * 8, name="dec4")
+        self.upconv3 = nn.ConvTranspose2d(
+            features * 8, features * 4, kernel_size=2, stride=2
+        )
+        self.decoder3 = UNet._block((features * 4) * 2, features * 4, name="dec3")
+        self.upconv2 = nn.ConvTranspose2d(
+            features * 4, features * 2, kernel_size=2, stride=2
+        )
+        self.decoder2 = UNet._block((features * 2) * 2, features * 2, name="dec2")
+        self.upconv1 = nn.ConvTranspose2d(
+            features * 2, features, kernel_size=2, stride=2
+        )
+        self.decoder1 = UNet._block(features * 2, features, name="dec1")
 
-        self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.dec2 = double_conv(512, 256)
-
-        self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.dec1 = double_conv(256, 128)
-
-        self.up0 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec0 = double_conv(128, 64)
-
-        # Final output layer
-        self.final = nn.Conv2d(64, out_channels, kernel_size=1)
-
-        # Pooling
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv = nn.Conv2d(
+            in_channels=features, out_channels=out_channels, kernel_size=1
+        )
 
     def forward(self, x):
-        # Encoder
-        x1 = self.enc1(x)  # (64, 256, 256)
-        p1 = self.pool(x1)  # (64, 128, 128)
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
+        enc4 = self.encoder4(self.pool3(enc3))
 
-        x2 = self.enc2(p1)  # (128, 128, 128)
-        p2 = self.pool(x2)  # (128, 64, 64)
+        bottleneck = self.bottleneck(self.pool4(enc4))
 
-        x3 = self.enc3(p2)  # (256, 64, 64)
-        p3 = self.pool(x3)  # (256, 32, 32)
+        dec4 = self.upconv4(bottleneck)
+        dec4 = torch.cat((dec4, enc4), dim=1)
+        dec4 = self.decoder4(dec4)
+        dec3 = self.upconv3(dec4)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.decoder3(dec3)
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.decoder2(dec2)
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.decoder1(dec1)
+        return torch.sigmoid(self.conv(dec1))
 
-        x4 = self.enc4(p3)  # (512, 32, 32)
-        p4 = self.pool(x4)  # (512, 16, 16)
-
-        # Bottleneck
-        bottleneck = self.bottleneck(p4)  # (1024, 16, 16)
-
-        # Decoder
-        up3 = self.up3(bottleneck)  # (512, 32, 32)
-        dec3 = self.dec3(torch.cat([up3, x4], dim=1))  # Concatenate along channel dimension
-
-        up2 = self.up2(dec3)  # (256, 64, 64)
-        dec2 = self.dec2(torch.cat([up2, x3], dim=1))  # Concatenate along channel dimension
-
-        up1 = self.up1(dec2)  # (128, 128, 128)
-        dec1 = self.dec1(torch.cat([up1, x2], dim=1))  # Concatenate along channel dimension
-
-        up0 = self.up0(dec1)  # (64, 256, 256)
-        dec0 = self.dec0(torch.cat([up0, x1], dim=1))  # Concatenate along channel dimension
-
-        # Final output
-        return self.final(dec0)
+    @staticmethod
+    def _block(in_channels, features, name):
+        return nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        name + "conv1",
+                        nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=features,
+                            kernel_size=3,
+                            padding=1,
+                            bias=False,
+                        ),
+                    ),
+                    (name + "norm1", nn.BatchNorm2d(num_features=features)),
+                    (name + "relu1", nn.ReLU(inplace=True)),
+                    (
+                        name + "conv2",
+                        nn.Conv2d(
+                            in_channels=features,
+                            out_channels=features,
+                            kernel_size=3,
+                            padding=1,
+                            bias=False,
+                        ),
+                    ),
+                    (name + "norm2", nn.BatchNorm2d(num_features=features)),
+                    (name + "relu2", nn.ReLU(inplace=True)),
+                ]
+            )
+        )

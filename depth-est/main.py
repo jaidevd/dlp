@@ -70,6 +70,7 @@ if __name__ == "__main__":
             with tqdm(total=len(loader) + len(val_loader)) as bbar:
                 model.train()
                 for images, depths in loader:
+                    opt.zero_grad()
                     pred = model(images)
                     loss = depth_loss(pred, depths)
                     loss.backward()
@@ -81,10 +82,12 @@ if __name__ == "__main__":
                 for images, depths in val_loader:
                     with torch.no_grad():
                         preds = model(images)
-                    loss = depth_loss(pred, depths)
+                    loss = depth_loss(preds, depths)
                     epoch_val_loss += loss.item()
                     bbar.update(1)
             epoch_train_loss /= len(loader)
             epoch_val_loss /= len(val_loader)
             ebar.set_postfix_str(f"{epoch_train_loss:.3f} / {epoch_val_loss:.3f}")
             ebar.update(1)
+
+    torch.save(model, "model.pth")
