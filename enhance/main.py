@@ -72,7 +72,7 @@ class EnhanceDataset(Dataset):
         plt.show()
 
 
-def collate(batch):
+def collate_denoise(batch):
     images, labels = map(torch.stack, zip(*batch))
     images = to_dtype(images, torch.float32, scale=True)
     h, w = labels.shape[-2:]

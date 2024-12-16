@@ -1,7 +1,7 @@
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from main import EnhanceDataset, CharbonnierLoss, collate
+from main import EnhanceDataset, CharbonnierLoss, collate_denoise
 
 from mprnet import MPRNet
 
@@ -24,12 +24,12 @@ criterion = CharbonnierLoss()
 # DataLoaders ###########
 train_dataset = EnhanceDataset("archive/train/train", "archive/train/gt")
 train_loader = DataLoader(
-    dataset=train_dataset, batch_size=3, shuffle=True, pin_memory=True, collate_fn=collate
+    dataset=train_dataset, batch_size=3, shuffle=True, pin_memory=True, collate_fn=collate_denoise
 )
 
 val_dataset = EnhanceDataset("archive/val/val", "archive/val/gt")
 val_loader = DataLoader(
-    dataset=val_dataset, batch_size=3, shuffle=True, pin_memory=True, collate_fn=collate
+    dataset=val_dataset, batch_size=3, shuffle=True, pin_memory=True, collate_fn=collate_denoise
 )
 
 n_epochs = 30
