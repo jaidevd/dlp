@@ -105,16 +105,17 @@ def train_srgan(generator, discriminator, train_loader, val_loader, n_epochs, de
     criterion_content = nn.MSELoss()
 
     # Optimizers
-    opt_g = optim.Adam(generator.parameters(), lr=0.001)
-    opt_d = optim.Adam(discriminator.parameters(), lr=0.001)
-    steppers = [optim.lr_scheduler.StepLR(opt_g, 10, gamma=0.5),
-                optim.lr_scheduler.StepLR(opt_d, 10, gamma=0.5)]
+    opt_g = optim.Adam(generator.parameters(), lr=0.000005)
+    opt_d = optim.Adam(discriminator.parameters(), lr=0.000005)
+    steppers = [optim.lr_scheduler.StepLR(opt_g, 5, gamma=0.5),
+                optim.lr_scheduler.StepLR(opt_d, 5, gamma=0.5)]
 
-    best_psnr = 0
+    best_psnr_epoch = best_psnr = 0
+    n_batches = len(train_loader) + len(val_loader)
 
     for epoch in range(n_epochs):
         epoch_train_loss = epoch_val_loss = train_psnr = val_psnr = 0
-        with tqdm(total=len(train_loader) + len(val_loader)) as pbar:
+        with tqdm(total=n_batches) as pbar:
             generator.train()
             discriminator.train()
             for lr_images, hr_images in train_loader:
@@ -203,10 +204,17 @@ def train_srgan(generator, discriminator, train_loader, val_loader, n_epochs, de
         epoch_val_loss /= len(val_loader)
         train_psnr /= len(train_loader)
         val_psnr /= len(val_loader)
-        current_psnr = (val_psnr + train_psnr) / 2
+        current_psnr = (val_psnr * len(val_loader) + train_psnr * len(train_loader)) / n_batches
         if current_psnr > best_psnr:
             best_psnr = current_psnr
+            best_psnr_epoch = epoch
+            print(f'Better model found at epoch {epoch}')  # NOQA: T201
             torch.save(generator.state_dict(), "generator-best.pth")
+            torch.save(discriminator.state_dict(), "discriminator-best.pth")
+        elif epoch - best_psnr_epoch > 5:
+            print(f'Stopping at epoch {epoch} - best epoch was {best_psnr_epoch}')  # NOQA: T201
+            break
+
         print(  # NOQA: T201
             f"Train: {epoch_train_loss:.4f}; Val: {epoch_val_loss:.4f};",
             f"Train PSNR: {train_psnr:.4f}; Val PSNR: {val_psnr:.4f}",
@@ -221,13 +229,14 @@ def collate_sr(batch):
 
 
 def main():
-    # Hyperparameters
-    n_epochs = 60
+    n_epochs = 10
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Initialize networks
     generator = Generator().to(device)
+    generator.load_state_dict(torch.load("generator-best.pth", weights_only=True))
     discriminator = Discriminator().to(device)
+    discriminator.load_state_dict(torch.load("discriminator-best.pth", weights_only=True))
 
     train_ds = EnhanceDataset("denoised/train/train/", "archive/train/gt/")
     train_loader = DataLoader(

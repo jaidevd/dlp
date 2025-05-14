@@ -8,3 +8,6 @@ profile_output*
 *.srt
 *.wav
 *.csv
+
+*.pt
+*.pth

@@ -117,7 +117,7 @@ class Encoder(nn.Module):
         enc3 = self.encoder_level3(x)
         if (encoder_outs is not None) and (decoder_outs is not None):
             enc3 = enc3 + self.csff_enc3(encoder_outs[2]) + self.csff_dec3(decoder_outs[2])
-        
+
         return [enc1, enc2, enc3]
 
 class Decoder(nn.Module):
@@ -151,7 +151,7 @@ class Decoder(nn.Module):
         return [dec1,dec2,dec3]
 
 ##########################################################################
-##---------- Resizing Modules ----------    
+##---------- Resizing Modules ----------
 class DownSample(nn.Module):
     def __init__(self, in_channels,s_factor):
         super(DownSample, self).__init__()
@@ -255,7 +255,7 @@ class MPRNet(nn.Module):
 
         self.sam12 = SAM(n_feat, kernel_size=1, bias=bias)
         self.sam23 = SAM(n_feat, kernel_size=1, bias=bias)
-        
+
         self.concat12  = conv(n_feat*2, n_feat, kernel_size, bias=bias)
         self.concat23  = conv(n_feat*2, n_feat+scale_orsnetfeats, kernel_size, bias=bias)
         self.tail     = conv(n_feat+scale_orsnetfeats, out_c, kernel_size, bias=bias)
@@ -285,17 +285,17 @@ class MPRNet(nn.Module):
         x1rtop = self.shallow_feat1(x1rtop_img)
         x1lbot = self.shallow_feat1(x1lbot_img)
         x1rbot = self.shallow_feat1(x1rbot_img)
-        
+
         ## Process features of all 4 patches with Encoder of Stage 1
         feat1_ltop = self.stage1_encoder(x1ltop)
         feat1_rtop = self.stage1_encoder(x1rtop)
         feat1_lbot = self.stage1_encoder(x1lbot)
         feat1_rbot = self.stage1_encoder(x1rbot)
-        
+
         ## Concat deep features
         feat1_top = [torch.cat((k,v), 3) for k,v in zip(feat1_ltop,feat1_rtop)]
         feat1_bot = [torch.cat((k,v), 3) for k,v in zip(feat1_lbot,feat1_rbot)]
-        
+
         ## Pass features through Decoder of Stage 1
         res1_top = self.stage1_decoder(feat1_top)
         res1_bot = self.stage1_decoder(feat1_bot)
@@ -305,7 +305,7 @@ class MPRNet(nn.Module):
         x2bot_samfeats, stage1_img_bot = self.sam12(res1_bot[0], x2bot_img)
 
         ## Output image at Stage 1
-        stage1_img = torch.cat([stage1_img_top, stage1_img_bot],2) 
+        stage1_img = torch.cat([stage1_img_top, stage1_img_bot],2)
         ##-------------------------------------------
         ##-------------- Stage 2---------------------
         ##-------------------------------------------
@@ -339,7 +339,7 @@ class MPRNet(nn.Module):
 
         ## Concatenate SAM features of Stage 2 with shallow features of Stage 3
         x3_cat = self.concat23(torch.cat([x3, x3_samfeats], 1))
-        
+
         x3_cat = self.stage3_orsnet(x3_cat, feat2, res2)
 
         stage3_img = self.tail(x3_cat)
